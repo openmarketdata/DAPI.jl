@@ -1,0 +1,9 @@
+name = "DAPI"
+uuid = "1dd7e320-2669-11e9-141a-630c3e54e2ff"
+authors = ["B "]
+version = "0.1.0"
+
+[deps]
+Dates = "ade2ca70-3891-5945-98fb-dc099432e06a"
+Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
+blpapi = "a41c293a-25e4-11e9-3ae7-dd332d60b1b6"
