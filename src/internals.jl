@@ -7,29 +7,29 @@ default_event_queue_init=false
 default_event_queue_count=Dict()
 default_event_last=nothing
 default_message_handler=Dict()
-for k in [:ADMIN,
-          :SESSION_STATUS,
-          :SUBSCRIPTION_STATUS,
-          :REQUEST_STATUS,
-          :RESPONSE,
-          :PARTIAL_RESPONSE,
-          :SUBSCRIPTION_DATA,
-          :SERVICE_STATUS,
-          :TIMEOUT,
-          :AUTHORIZATION_STATUS,
-          :RESOLUTION_STATUS,
-          :TOPIC_STATUS,
-          :TOKEN_STATUS,
-          :REQUEST,
-          :UNKNOWN]
-    default_message_handler[k]=Dict{Any,Function}()
-    default_message_handler[k][""]=x->@debug "$k message received"
-end
-default_debug_var=nothing
 
 function __init__()
     global default_event_queue
+    global default_message_handler
     ccall((:lfds611_queue_new,blpapi.blpapi3_helper),Cint,(Ptr{Cvoid},Cint),default_event_queue,64)
+    for k in [:ADMIN,
+              :SESSION_STATUS,
+              :SUBSCRIPTION_STATUS,
+              :REQUEST_STATUS,
+              :RESPONSE,
+              :PARTIAL_RESPONSE,
+              :SUBSCRIPTION_DATA,
+              :SERVICE_STATUS,
+              :TIMEOUT,
+              :AUTHORIZATION_STATUS,
+              :RESOLUTION_STATUS,
+              :TOPIC_STATUS,
+              :TOKEN_STATUS,
+              :REQUEST,
+              :UNKNOWN]
+        default_message_handler[k]=Dict{Any,Function}()
+        default_message_handler[k][""]=x->@debug "$k message received"
+    end
 end
 
 function default_event_handler(x)
@@ -37,6 +37,7 @@ function default_event_handler(x)
     global default_event_queue_init
     global default_event_queue_count
     global default_event_last
+    global default_message_handler
     if !default_event_queue_init # first event received
         ccall((:lfds611_queue_use,blpapi.blpapi3_helper),Cvoid,(Ptr{Cvoid},),default_event_queue)
         default_event_queue_init=true
@@ -212,6 +213,7 @@ function get_events(service)
 end
 
 function gen_subscriptions(session,service,events)
+    global default_message_handler
     subscriptions=Dict{Symbol,Any}()
     for (subscription_name,event) in pairs(events)
         subscription_function= function (;id::Union{Signed,String},kwargs...)
@@ -243,7 +245,7 @@ function gen_subscriptions(session,service,events)
             options=pop!(args,:options,Array{String,1}())
             handler=pop!(args,:handler,nothing)
             default_message_handler[:SUBSCRIPTION_DATA][id]=handler
-            blpapi_SubscriptionList_add(list,topic,id,fields,options,length(fields),length(options))            
+            blpapi_SubscriptionList_add(list,topic,id,fields,options,length(fields),length(options))
             blpapi_Session_subscribe(session,list,C_NULL,C_NULL,0)
             blpapi_SubscriptionList_destroy(list)                        
         end
@@ -485,7 +487,7 @@ function decode_schema_element(schema_element::Ptr{Nothing})
 end
 
 function process_message(message,event_type_code)
-    global default_debug_var
+    global default_message_handler
     eventType = EVENT_TYPE(event_type_code)
     messageType = blpapi_Message_typeString(message)
     if messageType in ["SlowConsumerWarning","SlowConsumerWarningCleared"]
@@ -494,7 +496,7 @@ function process_message(message,event_type_code)
     n=blpapi_Message_numCorrelationIds(message)
     contents = blpapi_Message_elements(message)
     elements = decode_element(contents)
-	if n>0        
+	if n>0
         t=blpapi_CorrelationId_type(message,0)
         correlationId = blpapi_Message_correlationId(message,0)
         @debug "$messageType with $n correlation id of type $t"
