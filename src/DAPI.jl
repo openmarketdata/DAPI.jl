@@ -2,9 +2,9 @@ module DAPI
 
 include("internals.jl")
 
-macro connect(connection,timeout,services)
+macro connect(connection,services,timeout)
     quote
-        $(esc(connection))=connect(timeout=$(esc(timeout)),services=$(esc(services)))
+        $(esc(connection))=connect(services=$(esc(services)),timeout=$(esc(timeout)))
         return nothing
     end
 end

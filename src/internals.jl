@@ -1,34 +1,84 @@
-using blpapi
-using Dates
+using blpapi, Dates
+
+include("constants.jl")
+
+const default_event_queue = Ref{Ptr{Cvoid}}(0)
+default_event_queue_init=false
+default_event_queue_count=Dict()
+default_event_last=nothing
+default_message_handler=Dict()
+for k in [:ADMIN,
+          :SESSION_STATUS,
+          :SUBSCRIPTION_STATUS,
+          :REQUEST_STATUS,
+          :RESPONSE,
+          :PARTIAL_RESPONSE,
+          :SUBSCRIPTION_DATA,
+          :SERVICE_STATUS,
+          :TIMEOUT,
+          :AUTHORIZATION_STATUS,
+          :RESOLUTION_STATUS,
+          :TOPIC_STATUS,
+          :TOKEN_STATUS,
+          :REQUEST,
+          :UNKNOWN]
+    default_message_handler[k]=Dict{Any,Function}()
+    default_message_handler[k][""]=x->@debug "$k message received"
+end
+default_debug_var=nothing
+
+function __init__()
+    global default_event_queue
+    ccall((:lfds611_queue_new,blpapi.blpapi3_helper),Cint,(Ptr{Cvoid},Cint),default_event_queue,64)
+end
+
+function default_event_handler(x)
+    global default_event_queue
+    global default_event_queue_init
+    global default_event_queue_count
+    global default_event_last
+    if !default_event_queue_init # first event received
+        ccall((:lfds611_queue_use,blpapi.blpapi3_helper),Cvoid,(Ptr{Cvoid},),default_event_queue)
+        default_event_queue_init=true
+    end
+    events=Ref{Ptr{Cvoid}}(0)
+    while 0<ccall((:lfds611_queue_dequeue,blpapi.blpapi3_helper),Cint,(Ptr{Cvoid},Ptr{Cvoid}),default_event_queue[],events)
+        event=events[]    
+        event_type_code=blpapi_Event_eventType(event)
+        event_type=EVENT_TYPE(event_type_code)
+        if !(event_type in keys(default_event_queue_count))
+            default_event_queue_count[event_type]=0
+        end
+        default_event_queue_count[event_type]+=1
+        default_message_handler[event_type][""](event) # overwrite each event_type's "" function to gain access to raw event
+        default_event_last=process_event(event,event_type_code)
+        blpapi_Event_release(event)
+    end
+end
 
 function connect(;host::String="localhost"
                  ,port::Signed=8194
-                 ,timeout::Union{AbstractFloat,Integer}=2.0
-                 ,services::Array{Symbol}=[:refdata])
+                 ,services::Array{Symbol}=[:refdata]
+                 ,timeout::Union{AbstractFloat,Integer}=2.0)
+    global default_event_queue
     session_options = blpapi_SessionOptions_create()
     blpapi_SessionOptions_setServerHost(session_options,host)
     blpapi_SessionOptions_setServerPort(session_options,port)
-    session = blpapi_Session_create(session_options,C_NULL,C_NULL,C_NULL)
+    blpapi_SessionOptions_setAutoRestartOnDisconnection(session_options,true)
+    session = blpapi_Session_create(session_options,default_event_handler,C_NULL,default_event_queue[])
     blpapi_SessionOptions_destroy(session_options)
-    blpapi_Session_start(session)
-    o=retrieve_event(session,:session,Int(timeout*1000),end_event=[:SESSION_STATUS,:UNKNOWN,:TIMEOUT])
-    if last(map(first,o))!="SessionConnectionUp"
-        blpapi_Session_destroy(session)
-        error(o)
-        return nothing
-    end
-    o=retrieve_event(session,:session,Int(timeout*1000),end_event=[:SESSION_STATUS,:UNKNOWN,:TIMEOUT])
-    if last(map(first,o))!="SessionStarted"        
-        blpapi_Session_destroy(session)
-        error(o)
-        return nothing
-    end
+    session_started=blpapi_Session_start(session)
+    if session_started!=0
+        error("session failed to start")
+    end    
     service_dict=Dict{Symbol,NamedTuple}()
     for name in unique(services)
         try
             full_name="//blp/"*string(name)
-            blpapi_Session_openService(session,full_name)
-            o=retrieve_event(session,:session,Int(timeout*1000),end_event=[:SERVICE_STATUS,:UNKNOWN,:TIMEOUT])
+            service_opened=blpapi_Session_openService(session,full_name)
+            if service_opened!=0
+                error("service $full_name failed to open")
+            end
             @blpapi_setPointer service blpapi_Session_getService(session,service,full_name)
             details=(service=service,)
             operations=get_operations(service)
@@ -90,7 +140,7 @@ end
 function gen_requests(session,service,operations)
     requests=Dict{Symbol,Any}()
     for (request_name,operation) in pairs(operations)      
-        request_function=function (;timeout=2,id::Union{Signed,String,Nothing}=nothing,kwargs...)
+        request_function=function (;id::Union{Signed,String,Nothing}=nothing,parser::Union{Nothing,Function}=nothing,timeout=2,kwargs...)
             mandatory=Symbol[]
             optional=Symbol[]
             for (k,v) in kwargs
@@ -99,7 +149,7 @@ function gen_requests(session,service,operations)
                 end
             end
             for (k,v) in pairs(operation)
-                # override for mandatory fields but minValues are not properly populated
+                # override for mandatory fields that minValues are not properly populated
                 required=false
                 if (v.minvalues>0) ||
                    (request_name==:ReferenceDataRequest && k in [:securities,:fields]) ||
@@ -121,7 +171,7 @@ function gen_requests(session,service,operations)
                     end
                 end
             end
-            if length(kwargs)==0
+            if (length(kwargs)==0)&&(length(mandatory)>0)
                 @error "see operations.$request_name for parameter details"
                 return (mandatory=mandatory,optional=optional)
             end
@@ -134,7 +184,12 @@ function gen_requests(session,service,operations)
             end            
             blpapi_Session_sendRequest(session,request,id,C_NULL,event_queue,C_NULL,0)
             blpapi_Request_destroy(request)
-            return retrieve_event(event_queue,:event_queue,Int(timeout*1000),end_event=[:RESPONSE,:UNKNOWN,:TIMEOUT])
+            response=retrieve_event(event_queue,:event_queue,Int(timeout*1000),end_event=[:RESPONSE,:UNKNOWN,:TIMEOUT])
+            if parser==nothing
+                return response
+            else
+                return parser(response)
+            end
         end
         requests[request_name]=request_function
     end
@@ -186,9 +241,11 @@ function gen_subscriptions(session,service,events)
             topic=pop!(args,:topic,"")
             fields=pop!(args,:fields,Array{String,1}())
             options=pop!(args,:options,Array{String,1}())
+            handler=pop!(args,:handler,nothing)
+            default_message_handler[:SUBSCRIPTION_DATA][id]=handler
             blpapi_SubscriptionList_add(list,topic,id,fields,options,length(fields),length(options))            
             blpapi_Session_subscribe(session,list,C_NULL,C_NULL,0)
-            blpapi_SubscriptionList_destroy(list)
+            blpapi_SubscriptionList_destroy(list)                        
         end
         subscriptions[subscription_name]=subscription_function
     end
@@ -215,13 +272,17 @@ function decode_datetime(val)
         return Time(val.hours,val.minutes,val.seconds,val.milliSeconds)
     else
         return nothing
-    end    
+    end
 end
 
 function decode_value(element,datatype,i)
     if blpapi_Element_numValues(element)==0
         #@warn "empty scalar element with datatype:$datatype"
-        return nothing
+        if datatype==BLPAPI_DATATYPE_STRING
+            return ""
+        else
+            return nothing
+        end
     end    
     if datatype==BLPAPI_DATATYPE_BOOL
         val=Ref{Int32}(0); blpapi_Element_getValueAsBool(element,val,i);
@@ -326,6 +387,8 @@ function encode_value!(data,element,i)
     elseif (data isa DateTime) && datatype==BLPAPI_DATATYPE_DATETIME
         val=encode_datetime(data)
         blpapi_Element_setValueDatetime(element,Ref(val),i)
+    elseif (data isa Signed) && datatype==BLPAPI_DATATYPE_ENUMERATION
+        blpapi_Element_setValueInt32(element,Int32(data),i)
     else
         error("nyi:encode '$(typeof(data))' to datatype $datatype")
     end    
@@ -421,22 +484,32 @@ function decode_schema_element(schema_element::Ptr{Nothing})
     return NamedTuple{(keys(schema)...,)}((values(schema)...,))
 end
 
-function process_message(message)
+function process_message(message,event_type_code)
+    global default_debug_var
+    eventType = EVENT_TYPE(event_type_code)
     messageType = blpapi_Message_typeString(message)
     if messageType in ["SlowConsumerWarning","SlowConsumerWarningCleared"]
         @warn "$messageType received"
     end
-	n=blpapi_Message_numCorrelationIds(message)
+    n=blpapi_Message_numCorrelationIds(message)
+    contents = blpapi_Message_elements(message)
+    elements = decode_element(contents)
 	if n>0        
         t=blpapi_CorrelationId_type(message,0)
-        @debug "$messageType with $n correlation id of type $t"        
-        @debug blpapi_Message_correlationId(message,0)
+        correlationId = blpapi_Message_correlationId(message,0)
+        @debug "$messageType with $n correlation id of type $t"
+        @debug "$correlationId at index 0"
+        if eventType in keys(default_message_handler)
+            if correlationId in keys(default_message_handler[eventType])
+                default_debug_var=elements
+                default_message_handler[eventType][correlationId](elements)
+            end
+        end
     end
-    contents = blpapi_Message_elements(message)
-    return decode_element(contents)
+    return elements
 end
 
-function process_event(event)
+function process_event(event,event_type_code)
     iterator = blpapi_MessageIterator_create(event)
     done = false
     messages = []
@@ -447,7 +520,7 @@ function process_event(event)
                 done = true
             else
                 try
-                    messages = vcat(messages,process_message(message))
+                    messages = vcat(messages,process_message(message,event_type_code))
                 catch err
                     @error err
                 end 
@@ -455,7 +528,7 @@ function process_event(event)
         end
     finally
         blpapi_MessageIterator_destroy(iterator)
-    end
+    end    
     return messages
 end
 
@@ -464,6 +537,9 @@ function retrieve_event(container,container_type,timeout::Int=1000;end_event::Ar
     events = []
     while !done
         if container_type==:session
+            if container==Ptr{Nothing}(0)
+                return nothing
+            end
             @blpapi_setPointer event blpapi_Session_nextEvent(container,event,timeout)
         elseif container_type==:event_queue
             event=blpapi_EventQueue_nextEvent(container,timeout)
@@ -472,27 +548,11 @@ function retrieve_event(container,container_type,timeout::Int=1000;end_event::Ar
         end
         try
             event_type_code = blpapi_Event_eventType(event)
-            if     event_type_code == BLPAPI_EVENTTYPE_ADMIN                event_type = :ADMIN                
-            elseif event_type_code == BLPAPI_EVENTTYPE_SESSION_STATUS       event_type = :SESSION_STATUS       
-            elseif event_type_code == BLPAPI_EVENTTYPE_SUBSCRIPTION_STATUS  event_type = :SUBSCRIPTION_STATUS  
-            elseif event_type_code == BLPAPI_EVENTTYPE_REQUEST_STATUS       event_type = :REQUEST_STATUS       
-            elseif event_type_code == BLPAPI_EVENTTYPE_RESPONSE             event_type = :RESPONSE             
-            elseif event_type_code == BLPAPI_EVENTTYPE_PARTIAL_RESPONSE     event_type = :PARTIAL_RESPONSE     
-            elseif event_type_code == BLPAPI_EVENTTYPE_SUBSCRIPTION_DATA    event_type = :SUBSCRIPTION_DATA    
-            elseif event_type_code == BLPAPI_EVENTTYPE_SERVICE_STATUS       event_type = :SERVICE_STATUS       
-            elseif event_type_code == BLPAPI_EVENTTYPE_TIMEOUT              event_type = :TIMEOUT              
-            elseif event_type_code == BLPAPI_EVENTTYPE_AUTHORIZATION_STATUS event_type = :AUTHORIZATION_STATUS 
-            elseif event_type_code == BLPAPI_EVENTTYPE_RESOLUTION_STATUS    event_type = :RESOLUTION_STATUS    
-            elseif event_type_code == BLPAPI_EVENTTYPE_TOPIC_STATUS         event_type = :TOPIC_STATUS         
-            elseif event_type_code == BLPAPI_EVENTTYPE_TOKEN_STATUS         event_type = :TOKEN_STATUS         
-            elseif event_type_code == BLPAPI_EVENTTYPE_REQUEST              event_type = :REQUEST              
-            else                                                            event_type = :UNKNOWN
-            end
-            
+            event_type=EVENT_TYPE(event_type_code)
             if event_type in [:UNKNOWN,:TIMEOUT]
-                @warn "receiving $event_type event"
+                @debug "receiving $event_type event"
             end
-            events = vcat(events,process_event(event))
+            events = vcat(events,process_event(event,event_type_code))
             if event_type in end_event
                 done = true
             end
